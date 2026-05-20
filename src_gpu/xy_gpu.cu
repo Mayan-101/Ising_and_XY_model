@@ -28,6 +28,13 @@ struct GpuState
     curandState *d_rng;
     double *d_sum_x;
     double *d_sum_y;
+    double *d_total_M;
+    
+    double *sweep_h;
+    double *sweep_M;
+    int *sweep_branch;
+    int sweep_capacity;
+    int sweep_count;
 };
 
 __global__ void k_init_rng(curandState *states, int height, int width,
@@ -42,7 +49,7 @@ __global__ void k_init_rng(curandState *states, int height, int width,
 }
 
 __global__ void k_update(double *grid, int height, int width,
-                         double T, double h, int parity, curandState *rng)
+                         double T, double h, double J, int parity, curandState *rng)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -63,9 +70,9 @@ __global__ void k_update(double *grid, int height, int width,
     double delta = (curand_uniform_double(&local) * 2.0 - 1.0) * DELTA_MAX;
     double theta_new = fmod(theta + delta + TWO_PI * 10.0, TWO_PI);
 
-    double dE = -((cos(theta_new - tL) - cos(theta - tL)) + (cos(theta_new - tR) - cos(theta - tR)) + (cos(theta_new - tU) - cos(theta - tU)) + (cos(theta_new - tD) - cos(theta - tD))) - h * (cos(theta_new) - cos(theta));
+    double dE = -(J * ((cos(theta_new - tL) - cos(theta - tL)) + (cos(theta_new - tR) - cos(theta - tR)) + (cos(theta_new - tU) - cos(theta - tU)) + (cos(theta_new - tD) - cos(theta - tD)))) - h * (cos(theta_new) - cos(theta));
 
-    if (dE <= 0.0 || (T > 0.0 && curand_uniform_double(&local) < exp(-dE / T)))
+    if (dE <= 0.0 || (T > 0.0 && curand_uniform_double(&local) < exp( -dE / T)))
         grid[idx] = theta_new;
 
     rng[idx] = local;
@@ -171,6 +178,16 @@ __global__ void k_calc_M(const double *grid, int height, int width, double *d_su
     }
 }
 
+__global__ void k_accumulate_M_xy(double *d_sum_x, double *d_sum_y, double *d_total_M, double norm) {
+    double x = *d_sum_x;
+    double y = *d_sum_y;
+    double m = sqrt(x * x + y * y) * norm;
+    *d_total_M += m;
+    
+    *d_sum_x = 0.0;
+    *d_sum_y = 0.0;
+}
+
 extern "C"
 {
 
@@ -186,10 +203,18 @@ extern "C"
         CUDA_CHECK(cudaMalloc(&s->d_rng, height * width * sizeof(curandState)));
         CUDA_CHECK(cudaMalloc(&s->d_sum_x, sizeof(double)));
         CUDA_CHECK(cudaMalloc(&s->d_sum_y, sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&s->d_total_M, sizeof(double)));
 
         dim3 t(16, 16);
         k_init_rng<<<blocks(width, height, t), t>>>(s->d_rng, height, width, 42ULL);
         CUDA_CHECK(cudaDeviceSynchronize());
+        
+        s->sweep_capacity = 2000;
+        s->sweep_h = (double *)malloc(s->sweep_capacity * sizeof(double));
+        s->sweep_M = (double *)malloc(s->sweep_capacity * sizeof(double));
+        s->sweep_branch = (int *)malloc(s->sweep_capacity * sizeof(int));
+        s->sweep_count = 0;
+        
         return s;
     }
 
@@ -200,6 +225,10 @@ extern "C"
         cudaFree(s->d_rng);
         cudaFree(s->d_sum_x);
         cudaFree(s->d_sum_y);
+        cudaFree(s->d_total_M);
+        free(s->sweep_h);
+        free(s->sweep_M);
+        free(s->sweep_branch);
         free(s);
     }
 
@@ -210,13 +239,13 @@ extern "C"
                               cudaMemcpyHostToDevice));
     }
 
-    __declspec(dllexport) void gpu_update_grid(GpuState *s, double T, double h)
+    __declspec(dllexport) void gpu_update_grid(GpuState *s, double T, double h, double J)
     {
         dim3 t(16, 16);
         dim3 b = blocks(s->width, s->height, t);
         for (int parity = 0; parity <= 1; parity++)
         {
-            k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, parity, s->d_rng);
+            k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, J, parity, s->d_rng);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
     }
@@ -250,5 +279,74 @@ extern "C"
 
         double M = sqrt(sum_x * sum_x + sum_y * sum_y) / (double)(s->height * s->width);
         return M;
+    }
+
+    __declspec(dllexport) void gpu_run_hysteresis(GpuState *s, double T, double h_max, int h_steps, int equil_sweeps, int meas_sweeps, double J)
+    {
+        int total_steps = (h_steps + 1) * 2;
+        if (s->sweep_capacity < total_steps) {
+            s->sweep_capacity = total_steps;
+            s->sweep_h = (double *)realloc(s->sweep_h, s->sweep_capacity * sizeof(double));
+            s->sweep_M = (double *)realloc(s->sweep_M, s->sweep_capacity * sizeof(double));
+            s->sweep_branch = (int *)realloc(s->sweep_branch, s->sweep_capacity * sizeof(int));
+        }
+        s->sweep_count = 0;
+
+        dim3 t(16, 16);
+        dim3 b = blocks(s->width, s->height, t);
+        int shared_mem_size = 2 * t.x * t.y * sizeof(double);
+        double norm = 1.0 / (double)(s->height * s->width);
+
+        // DRY loop implementation consolidating branch 0 and branch 1
+        for (int branch = 0; branch <= 1; branch++)
+        {
+            for (int step = 0; step <= h_steps; step++)
+            {
+                double h = (branch == 0)
+                         ? (h_max - (2.0 * h_max * step) / h_steps)
+                         : (-h_max + (2.0 * h_max * step) / h_steps);
+
+                // Equilibrate
+                for (int eq = 0; eq < equil_sweeps; eq++) {
+                    k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, J, 0, s->d_rng);
+                    k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, J, 1, s->d_rng);
+                }
+
+                double zero = 0.0;
+                CUDA_CHECK(cudaMemcpyAsync(s->d_sum_x, &zero, sizeof(double), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(s->d_sum_y, &zero, sizeof(double), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpyAsync(s->d_total_M, &zero, sizeof(double), cudaMemcpyHostToDevice));
+
+                // Measure sweeps
+                for (int me = 0; me < meas_sweeps; me++) {
+                    k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, J, 0, s->d_rng);
+                    k_update<<<b, t>>>(s->d_grid, s->height, s->width, T, h, J, 1, s->d_rng);
+                    k_calc_M<<<b, t, shared_mem_size>>>(s->d_grid, s->height, s->width, s->d_sum_x, s->d_sum_y);
+                    k_accumulate_M_xy<<<1, 1>>>(s->d_sum_x, s->d_sum_y, s->d_total_M, norm);
+                }
+
+                double total_m = 0.0;
+                CUDA_CHECK(cudaMemcpy(&total_m, s->d_total_M, sizeof(double), cudaMemcpyDeviceToHost));
+                
+                s->sweep_h[s->sweep_count] = h;
+                s->sweep_M[s->sweep_count] = total_m / meas_sweeps;
+                s->sweep_branch[s->sweep_count] = branch;
+                s->sweep_count++;
+            }
+        }
+    }
+
+    __declspec(dllexport) void gpu_save_csv(GpuState *s, const char *filename)
+    {
+        FILE *fp = fopen(filename, "w");
+        if (!fp) {
+            fprintf(stderr, "gpu_save_csv: Cannot open %s for writing\n", filename);
+            return;
+        }
+        fprintf(fp, "h,M,branch\n");
+        for (int i = 0; i < s->sweep_count; i++) {
+            fprintf(fp, "%.8f,%.8f,%d\n", s->sweep_h[i], s->sweep_M[i], s->sweep_branch[i]);
+        }
+        fclose(fp);
     }
 }
