@@ -1,6 +1,5 @@
 /build
 *.exe
-*.md
 *.csv
 *.exp
 *.lib

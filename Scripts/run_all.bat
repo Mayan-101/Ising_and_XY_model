@@ -5,7 +5,7 @@ cd /d "%~dp0.."
 :menu
 cls
 echo =======================================================================
-echo          KAWASAKI DYNAMICS SIMULATION SUITE - INTERACTIVE MENU
+echo          XY OR ISING MODEL SIMULATION SUITE - INTERACTIVE MENU
 echo =======================================================================
 echo.
 echo   [SDL2 INTERACTIVE GRAPHICS MODE]

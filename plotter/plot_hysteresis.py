@@ -112,7 +112,7 @@ def plot_file(csv_path):
 
 def main():
     print("=========================================")
-    print("      Kawasaki Hysteresis Plotter       ")
+    print("    XY or Ising Model Hysteresis Plotter ")
     print("=========================================")
     
     # Search in current directory first
